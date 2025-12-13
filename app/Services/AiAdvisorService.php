@@ -3,23 +3,31 @@
 namespace App\Services;
 
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\File;
 use App\Models\Mahasiswa;
-use App\Services\AkademikCalculationService;
+use App\Services\AcademicAdvisor\AdvisorContextBuilder;
+use App\Services\AcademicAdvisor\AdvisorGuards;
 
 class AiAdvisorService
 {
-    protected AkademikCalculationService $calculationService;
+    protected AdvisorContextBuilder $contextBuilder;
+    protected AdvisorGuards $guards;
     protected string $apiKey;
-    protected string $model = 'llama-3.3-70b-versatile'; // Groq Llama model
+    protected string $model = 'llama-3.3-70b-versatile';
 
-    public function __construct(AkademikCalculationService $calculationService)
-    {
-        $this->calculationService = $calculationService;
+    protected const MAX_RETRIES = 1;
+
+    public function __construct(
+        AdvisorContextBuilder $contextBuilder,
+        AdvisorGuards $guards
+    ) {
+        $this->contextBuilder = $contextBuilder;
+        $this->guards = $guards;
         $this->apiKey = config('services.groq.api_key', '');
     }
 
     /**
-     * Send a chat message to Groq with student context
+     * Send a chat message to Groq with grounded student context
      */
     public function chat(Mahasiswa $mahasiswa, string $message, array $history = []): array
     {
@@ -30,12 +38,104 @@ class AiAdvisorService
             ];
         }
 
-        $context = $this->buildContext($mahasiswa);
-        $systemPrompt = $this->buildSystemPrompt($context);
+        try {
+            // Step 1: Build context
+            $context = $this->contextBuilder->build($mahasiswa);
 
-        // Build messages for Groq (OpenAI-compatible format)
+            // Step 2: Run pre-guards
+            $this->guards->assertRulesPresent($context);
+            $this->guards->validateContext($context);
+
+            // Step 3: Build system prompt with context
+            $systemPrompt = $this->buildSystemPrompt($context);
+
+            // Step 4: Call LLM
+            $response = $this->callLlm($systemPrompt, $message, $history);
+
+            if (!$response['success']) {
+                return $response;
+            }
+
+            $output = $response['message'];
+
+            // Step 5: Run post-guards
+            $guardResult = $this->guards->runPostGuards($context, $output);
+
+            if (!$guardResult['passed']) {
+                // Try retry if allowed
+                if ($guardResult['should_retry'] && $guardResult['retry_prompt']) {
+                    $retryResponse = $this->retryWithGuardPrompt(
+                        $systemPrompt,
+                        $message,
+                        $output,
+                        $guardResult['retry_prompt'],
+                        $history
+                    );
+
+                    if ($retryResponse['success']) {
+                        // Check guards again on retry
+                        $retryGuardResult = $this->guards->runPostGuards($context, $retryResponse['message']);
+                        if ($retryGuardResult['passed']) {
+                            return $retryResponse;
+                        }
+                    }
+                }
+
+                // Use replacement output if guard provides one
+                if ($guardResult['replacement_output']) {
+                    return [
+                        'success' => true,
+                        'message' => $guardResult['replacement_output'],
+                        'guard_applied' => true,
+                    ];
+                }
+            }
+
+            return [
+                'success' => true,
+                'message' => $output,
+            ];
+
+        } catch (\InvalidArgumentException $e) {
+            return [
+                'success' => false,
+                'message' => 'Konfigurasi akademik tidak valid: ' . $e->getMessage(),
+            ];
+        } catch (\Exception $e) {
+            return [
+                'success' => false,
+                'message' => 'Terjadi kesalahan: ' . $e->getMessage(),
+            ];
+        }
+    }
+
+    /**
+     * Build system prompt from template with context
+     */
+    protected function buildSystemPrompt(array $context): string
+    {
+        $templatePath = resource_path('prompts/academic_advisor_system.txt');
+
+        if (File::exists($templatePath)) {
+            $template = File::get($templatePath);
+        } else {
+            $template = $this->getDefaultPromptTemplate();
+        }
+
+        // Inject context JSON
+        $contextJson = json_encode($context, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+        $prompt = str_replace('{{CONTEXT_JSON}}', $contextJson, $template);
+
+        return $prompt;
+    }
+
+    /**
+     * Call LLM API
+     */
+    protected function callLlm(string $systemPrompt, string $message, array $history = []): array
+    {
         $messages = [];
-        
+
         // Add system prompt
         $messages[] = [
             'role' => 'system',
@@ -65,14 +165,14 @@ class AiAdvisorService
                 ->post('https://api.groq.com/openai/v1/chat/completions', [
                     'model' => $this->model,
                     'messages' => $messages,
-                    'temperature' => 0.7,
+                    'temperature' => 0.3, // Lower temperature for more deterministic outputs
                     'max_completion_tokens' => 1024,
                 ]);
 
             if ($response->successful()) {
                 $data = $response->json();
                 $text = $data['choices'][0]['message']['content'] ?? 'Maaf, saya tidak bisa memberikan respons saat ini.';
-                
+
                 return [
                     'success' => true,
                     'message' => $text,
@@ -87,226 +187,154 @@ class AiAdvisorService
         } catch (\Exception $e) {
             return [
                 'success' => false,
-                'message' => 'Terjadi kesalahan: ' . $e->getMessage(),
+                'message' => 'Terjadi kesalahan koneksi: ' . $e->getMessage(),
             ];
         }
     }
 
     /**
-     * Build context from mahasiswa data
+     * Retry with guard prompt
      */
-    protected function buildContext(Mahasiswa $mahasiswa): array
-    {
-        $mahasiswa->load(['user', 'prodi.fakultas', 'dosenPa.user']);
+    protected function retryWithGuardPrompt(
+        string $systemPrompt,
+        string $originalMessage,
+        string $previousOutput,
+        string $guardPrompt,
+        array $history
+    ): array {
+        $messages = [];
 
-        // Get IPK data
-        $ipkData = $this->calculationService->calculateIPK($mahasiswa);
-        
-        // Get IPS history
-        $ipsHistory = $this->calculationService->getIPSHistory($mahasiswa);
-        
-        // Get grade distribution
-        $gradeDistribution = $this->calculationService->getGradeDistribution($mahasiswa);
-        
-        // Get transcript with details
-        $transcript = $this->calculationService->getTranscript($mahasiswa);
+        // Add system prompt
+        $messages[] = [
+            'role' => 'system',
+            'content' => $systemPrompt
+        ];
 
-        // Get jadwal kuliah semester aktif
-        $jadwalList = \App\Models\JadwalKuliah::whereHas('kelas.krsDetail.krs', function($q) use ($mahasiswa) {
-            $q->where('mahasiswa_id', $mahasiswa->id)
-              ->where('status', 'approved')
-              ->whereHas('tahunAkademik', fn($ta) => $ta->where('is_active', true));
-        })->with('kelas.mataKuliah')->get();
-
-        $jadwal = $jadwalList->map(fn($j) => [
-            'hari' => $j->hari,
-            'jam' => substr($j->jam_mulai, 0, 5) . '-' . substr($j->jam_selesai, 0, 5),
-            'matkul' => $j->kelas->mataKuliah->nama_mk ?? '-',
-            'ruangan' => $j->ruangan ?? '-',
-        ])->toArray();
-
-        // Get presensi rekap semester aktif
-        $presensiService = app(\App\Services\PresensiService::class);
-        $kelasList = \App\Models\Kelas::whereHas('krsDetail.krs', function($q) use ($mahasiswa) {
-            $q->where('mahasiswa_id', $mahasiswa->id)
-              ->where('status', 'approved')
-              ->whereHas('tahunAkademik', fn($ta) => $ta->where('is_active', true));
-        })->with('mataKuliah')->get();
-
-        $presensi = $kelasList->map(function($kelas) use ($mahasiswa, $presensiService) {
-            $rekap = $presensiService->getRekapPresensi($mahasiswa->id, $kelas->id);
-            return [
-                'matkul' => $kelas->mataKuliah->nama_mk ?? '-',
-                'hadir' => $rekap['hadir'],
-                'sakit' => $rekap['sakit'],
-                'izin' => $rekap['izin'],
-                'alpa' => $rekap['alpa'],
-                'persentase' => $rekap['persentase'] . '%',
+        // Add history
+        foreach ($history as $msg) {
+            $messages[] = [
+                'role' => $msg['role'] === 'user' ? 'user' : 'assistant',
+                'content' => $msg['content']
             ];
-        })->toArray();
+        }
 
-        // Get detailed grades per course
-        $detailNilai = [];
-        foreach ($transcript['semesters'] ?? [] as $sem) {
-            foreach ($sem['courses'] ?? [] as $course) {
-                $detailNilai[] = [
-                    'semester' => $sem['semester'],
-                    'kode' => $course['kode'],
-                    'matkul' => $course['nama'],
-                    'sks' => $course['sks'],
-                    'nilai' => $course['nilai_huruf'],
+        // Add original message
+        $messages[] = [
+            'role' => 'user',
+            'content' => $originalMessage
+        ];
+
+        // Add previous (problematic) output
+        $messages[] = [
+            'role' => 'assistant',
+            'content' => $previousOutput
+        ];
+
+        // Add guard retry prompt
+        $messages[] = [
+            'role' => 'user',
+            'content' => $guardPrompt
+        ];
+
+        try {
+            $response = Http::timeout(30)
+                ->withHeaders([
+                    'Authorization' => 'Bearer ' . $this->apiKey,
+                    'Content-Type' => 'application/json',
+                ])
+                ->post('https://api.groq.com/openai/v1/chat/completions', [
+                    'model' => $this->model,
+                    'messages' => $messages,
+                    'temperature' => 0.1, // Even lower for retry
+                    'max_completion_tokens' => 1024,
+                ]);
+
+            if ($response->successful()) {
+                $data = $response->json();
+                $text = $data['choices'][0]['message']['content'] ?? '';
+
+                return [
+                    'success' => true,
+                    'message' => $text,
+                    'is_retry' => true,
                 ];
             }
-        }
 
-        return [
-            'nama' => $mahasiswa->user->name,
-            'nim' => $mahasiswa->nim,
-            'prodi' => $mahasiswa->prodi->nama ?? '-',
-            'fakultas' => $mahasiswa->prodi->fakultas->nama ?? '-',
-            'angkatan' => $mahasiswa->angkatan,
-            'dosen_pa' => $mahasiswa->dosenPa->user->name ?? '-',
-            'ipk' => $ipkData['ips'],
-            'total_sks' => $ipkData['total_sks'],
-            'ips_history' => $ipsHistory->map(fn($s) => [
-                'semester' => $s['tahun_akademik'],
-                'ips' => $s['ips'],
-                'sks' => $s['total_sks'],
-            ])->values()->toArray(),
-            'grade_distribution' => $gradeDistribution,
-            'max_sks' => $this->calculationService->getMaxSKS($ipsHistory->filter(fn($s) => $s['ips'] > 0)->last()['ips'] ?? 0),
-            'jadwal' => $jadwal,
-            'presensi' => $presensi,
-            'detail_nilai' => $detailNilai,
-        ];
+            return [
+                'success' => false,
+                'message' => 'Retry failed',
+            ];
+        } catch (\Exception $e) {
+            return [
+                'success' => false,
+                'message' => 'Retry failed: ' . $e->getMessage(),
+            ];
+        }
     }
 
     /**
-     * Build system prompt with context
+     * Get the context builder instance
      */
-    protected function buildSystemPrompt(array $context): string
+    public function getContextBuilder(): AdvisorContextBuilder
     {
-        $ipsHistoryStr = collect($context['ips_history'])
-            ->map(fn($s) => "Semester {$s['semester']}: IPS={$s['ips']}, SKS={$s['sks']}")
-            ->join(" | ") ?: "Tidak ada data";
+        return $this->contextBuilder;
+    }
 
-        $gradeStr = collect($context['grade_distribution'])
-            ->map(fn($count, $grade) => "$grade:$count")
-            ->join(', ') ?: "Tidak ada data";
+    /**
+     * Get the guards instance
+     */
+    public function getGuards(): AdvisorGuards
+    {
+        return $this->guards;
+    }
 
-        $jadwalStr = collect($context['jadwal'])
-            ->map(fn($j) => "{$j['hari']} {$j['jam']} - {$j['matkul']} (R.{$j['ruangan']})")
-            ->join(" | ") ?: "Tidak ada jadwal semester ini";
-
-        $presensiStr = collect($context['presensi'])
-            ->map(fn($p) => "{$p['matkul']}: Hadir={$p['hadir']}, Sakit={$p['sakit']}, Izin={$p['izin']}, Alpa={$p['alpa']}, Persentase={$p['persentase']}")
-            ->join(" | ") ?: "Tidak ada data presensi";
-
-        $nilaiDetailStr = collect($context['detail_nilai'])
-            ->map(fn($c) => "[{$c['semester']}] {$c['kode']} {$c['matkul']} ({$c['sks']}SKS) = {$c['nilai']}")
-            ->join(" | ") ?: "Tidak ada data nilai";
-
-        // Calculate additional analytics
-        $totalMK = count($context['detail_nilai']);
-        $nilaiA = collect($context['detail_nilai'])->filter(fn($n) => in_array($n['nilai'], ['A', 'A-']))->count();
-        $nilaiB = collect($context['detail_nilai'])->filter(fn($n) => str_starts_with($n['nilai'] ?? '', 'B'))->count();
-        $nilaiC = collect($context['detail_nilai'])->filter(fn($n) => str_starts_with($n['nilai'] ?? '', 'C'))->count();
-        $nilaiD = collect($context['detail_nilai'])->filter(fn($n) => str_starts_with($n['nilai'] ?? '', 'D'))->count();
-        $nilaiE = collect($context['detail_nilai'])->filter(fn($n) => ($n['nilai'] ?? '') === 'E')->count();
-        
-        $avgPresensi = collect($context['presensi'])->avg(fn($p) => (float) str_replace('%', '', $p['persentase'])) ?? 0;
-        $lowPresensi = collect($context['presensi'])->filter(fn($p) => (float) str_replace('%', '', $p['persentase']) < 80)->pluck('matkul')->join(', ');
-
-        $ipsTrend = 'stabil';
-        $ipsValues = collect($context['ips_history'])->pluck('ips')->filter(fn($v) => $v > 0)->values();
-        if ($ipsValues->count() >= 2) {
-            $last = $ipsValues->last();
-            $prev = $ipsValues->slice(-2, 1)->first();
-            if ($last > $prev + 0.1) $ipsTrend = 'meningkat';
-            elseif ($last < $prev - 0.1) $ipsTrend = 'menurun';
-        }
-
-        return <<<PROMPT
+    /**
+     * Default prompt template if file not found
+     */
+    protected function getDefaultPromptTemplate(): string
+    {
+        return <<<'PROMPT'
 <SYSTEM_IDENTITY>
-Kamu adalah AI Academic Advisor untuk SIAKAD Universitas Riau. Kamu adalah asisten akademik yang sangat cerdas, analitis, dan profesional.
+Kamu adalah AI Academic Advisor untuk SIAKAD. Jawab HANYA berdasarkan data context JSON.
 </SYSTEM_IDENTITY>
 
 <GROUNDING_RULES>
-ATURAN KRITIS - WAJIB DIPATUHI:
-1. HANYA gunakan data yang tersedia di bawah. JANGAN PERNAH mengarang/menebak data yang tidak ada.
-2. Jika ditanya sesuatu yang datanya tidak tersedia, JAWAB dengan jujur: "Maaf, data tersebut tidak tersedia dalam sistem."
-3. Jika diminta menghitung sesuatu, gunakan ANGKA PERSIS dari data, bukan perkiraan.
-4. JANGAN PERNAH mengarang nama dosen, mata kuliah, atau nilai yang tidak ada dalam data.
-5. Setiap klaim harus bisa diverifikasi dari data yang diberikan.
+1. HANYA gunakan data dari context JSON
+2. JANGAN menggunakan asumsi umum (biasanya, umumnya, tergantung)
+3. Jika data tidak ada, katakan "data belum tersedia"
+4. Gunakan status: LULUS, SEDANG_DIAMBIL, TERSEDIA_DI_KURIKULUM
+5. Jangan simpulkan presensi rendah jika attendance.data_available = false
 </GROUNDING_RULES>
 
-<STUDENT_DATABASE>
-IDENTITAS:
-- Nama Lengkap: {$context['nama']}
-- NIM: {$context['nim']}
-- Program Studi: {$context['prodi']}
-- Fakultas: {$context['fakultas']}
-- Tahun Angkatan: {$context['angkatan']}
-- Dosen Pembimbing Akademik: {$context['dosen_pa']}
-
-STATISTIK AKADEMIK:
-- IPK Kumulatif: {$context['ipk']}
-- Total SKS Lulus: {$context['total_sks']} SKS
-- Maksimum SKS Semester Depan: {$context['max_sks']} SKS
-- Jumlah Mata Kuliah Selesai: {$totalMK}
-- Trend IPS: {$ipsTrend}
-
-DISTRIBUSI NILAI:
-- Nilai A/A-: {$nilaiA} mata kuliah
-- Nilai B+/B/B-: {$nilaiB} mata kuliah
-- Nilai C+/C: {$nilaiC} mata kuliah
-- Nilai D: {$nilaiD} mata kuliah
-- Nilai E: {$nilaiE} mata kuliah
-
-RIWAYAT IPS:
-{$ipsHistoryStr}
-
-JADWAL KULIAH AKTIF:
-{$jadwalStr}
-
-REKAP PRESENSI (Rata-rata: {$avgPresensi}%):
-{$presensiStr}
-Mata kuliah presensi rendah (<80%): {$lowPresensi}
-
-DETAIL SEMUA NILAI:
-{$nilaiDetailStr}
-</STUDENT_DATABASE>
-
-<ANALYSIS_FRAMEWORK>
-Saat menjawab, gunakan pendekatan analisis mendalam:
-1. IDENTIFIKASI: Pahami pertanyaan dengan tepat
-2. EKSTRAK: Ambil data relevan dari database mahasiswa
-3. ANALISIS: Lakukan perhitungan/perbandingan jika diperlukan
-4. SINTESIS: Gabungkan temuan menjadi insight bermakna
-5. REKOMENDASI: Berikan saran actionable berdasarkan analisis
-</ANALYSIS_FRAMEWORK>
-
-<OUTPUT_FORMAT>
-ATURAN FORMAT RESPONS:
-1. Gunakan bahasa Indonesia profesional dan natural
-2. JANGAN gunakan heading markdown (# atau ##)
-3. JANGAN gunakan emoji
-4. Gunakan **bold** untuk angka/data penting
-5. Gunakan paragraf yang mengalir, bukan list panjang
-6. Jika perlu list, gunakan bullet (-) dengan singkat
-7. Respons harus informatif namun ringkas
-8. Sertakan data numerik spesifik untuk mendukung setiap klaim
-</OUTPUT_FORMAT>
-
-<CAPABILITY_EXAMPLES>
-Contoh kemampuan analisis:
-- "Berdasarkan data, IPS Anda menunjukkan trend {$ipsTrend}..."
-- "Dari {$totalMK} mata kuliah, Anda memiliki {$nilaiA} nilai A/A-..."
-- "Rata-rata presensi Anda adalah {$avgPresensi}%..."
-- "Dengan IPS terakhir, Anda dapat mengambil maksimal {$context['max_sks']} SKS..."
-</CAPABILITY_EXAMPLES>
-
-Siap menerima pertanyaan mahasiswa.
+<DATA_CONTEXT>
+{{CONTEXT_JSON}}
+</DATA_CONTEXT>
 PROMPT;
+    }
+
+    /**
+     * Build context for external use (e.g., testing)
+     */
+    public function buildContext(Mahasiswa $mahasiswa): array
+    {
+        return $this->contextBuilder->build($mahasiswa);
+    }
+
+    /**
+     * Calculate graduation progress
+     */
+    public function calculateGraduationProgress(Mahasiswa $mahasiswa): array
+    {
+        $context = $this->contextBuilder->build($mahasiswa);
+        return $this->contextBuilder->calculateGraduationProgress($context);
+    }
+
+    /**
+     * Find course by name
+     */
+    public function findCourse(Mahasiswa $mahasiswa, string $courseName): ?array
+    {
+        $context = $this->contextBuilder->build($mahasiswa);
+        return $this->contextBuilder->findCourseByName($context, $courseName);
     }
 }
