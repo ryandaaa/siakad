@@ -12,9 +12,6 @@ use App\Http\Controllers\Admin\DashboardController;
 use App\Http\Controllers\Admin\KrsApprovalController;
 use App\Http\Controllers\Admin\MahasiswaController;
 use App\Http\Controllers\Admin\DosenController;
-use App\Http\Controllers\Mahasiswa\KrsController;
-use App\Http\Controllers\Mahasiswa\TranskripController;
-use App\Http\Controllers\Dosen\PenilaianController;
 use App\Http\Controllers\HealthController;
 
 // Health check routes (no auth required)
@@ -143,70 +140,6 @@ Route::middleware(['auth', 'role:admin', 'fakultas.scope'])->prefix('admin')->na
     Route::get('/kehadiran-dosen/{dosen}', [\App\Http\Controllers\Admin\KehadiranDosenController::class, 'show'])->name('kehadiran-dosen.show');
 });
 
-// --- MAHASISWA ROUTES ---
-Route::middleware(['auth', 'role:mahasiswa'])->prefix('mahasiswa')->name('mahasiswa.')->group(function () {
-    // Dashboard
-    Route::get('/dashboard', [\App\Http\Controllers\Mahasiswa\DashboardController::class, 'index'])->name('dashboard');
-
-    Route::get('/krs', [KrsController::class, 'index'])->name('krs.index');
-    Route::post('/krs', [KrsController::class, 'store'])->middleware('throttle:krs')->name('krs.store');
-    Route::delete('/krs/{detailId}', [KrsController::class, 'destroy'])->middleware('throttle:krs')->name('krs.destroy');
-    Route::post('/krs/submit', [KrsController::class, 'submit'])->middleware('throttle:krs')->name('krs.submit');
-    Route::post('/krs/revise', [KrsController::class, 'revise'])->middleware('throttle:krs')->name('krs.revise');
-    
-    // Transkrip
-    Route::get('/transkrip', [TranskripController::class, 'index'])->name('transkrip.index');
-    
-    // Biodata
-    Route::get('/biodata', [\App\Http\Controllers\Mahasiswa\BiodataController::class, 'index'])->name('biodata.index');
-    Route::put('/biodata', [\App\Http\Controllers\Mahasiswa\BiodataController::class, 'update'])->name('biodata.update');
-    Route::put('/biodata/password', [\App\Http\Controllers\Mahasiswa\BiodataController::class, 'updatePassword'])->name('biodata.password');
-
-    // Presensi
-    Route::get('/presensi', [\App\Http\Controllers\Mahasiswa\PresensiController::class, 'index'])->name('presensi.index');
-    Route::get('/presensi/{kelas}', [\App\Http\Controllers\Mahasiswa\PresensiController::class, 'show'])->name('presensi.show');
-
-    // Jadwal Kuliah
-    Route::get('/jadwal', [\App\Http\Controllers\Mahasiswa\JadwalController::class, 'index'])->name('jadwal.index');
-
-    // KHS (Kartu Hasil Studi)
-    Route::get('/khs', [\App\Http\Controllers\Mahasiswa\KhsController::class, 'index'])->name('khs.index');
-    Route::get('/khs/{tahunAkademik}', [\App\Http\Controllers\Mahasiswa\KhsController::class, 'show'])->name('khs.show');
-
-    // Export PDF
-    Route::get('/export/transkrip', [\App\Http\Controllers\Mahasiswa\ExportController::class, 'transkrip'])->name('export.transkrip');
-    Route::get('/export/khs/{tahunAkademik}', [\App\Http\Controllers\Mahasiswa\ExportController::class, 'khs'])->name('export.khs');
-
-    // AI Academic Advisor
-    Route::get('/ai-advisor', [\App\Http\Controllers\Mahasiswa\AiAdvisorController::class, 'index'])->name('ai-advisor.index');
-    Route::post('/ai-advisor/chat', [\App\Http\Controllers\Mahasiswa\AiAdvisorController::class, 'chat'])->middleware('throttle:ai-chat')->name('ai-advisor.chat');
-
-    // Skripsi
-    Route::get('/skripsi', [\App\Http\Controllers\Mahasiswa\SkripsiController::class, 'index'])->name('skripsi.index');
-    Route::get('/skripsi/create', [\App\Http\Controllers\Mahasiswa\SkripsiController::class, 'create'])->name('skripsi.create');
-    Route::post('/skripsi', [\App\Http\Controllers\Mahasiswa\SkripsiController::class, 'store'])->name('skripsi.store');
-    Route::post('/skripsi/bimbingan', [\App\Http\Controllers\Mahasiswa\SkripsiController::class, 'storeBimbingan'])->name('skripsi.bimbingan.store');
-
-    // KP
-    Route::get('/kp', [\App\Http\Controllers\Mahasiswa\KpController::class, 'index'])->name('kp.index');
-    Route::get('/kp/create', [\App\Http\Controllers\Mahasiswa\KpController::class, 'create'])->name('kp.create');
-    Route::post('/kp', [\App\Http\Controllers\Mahasiswa\KpController::class, 'store'])->name('kp.store');
-    Route::post('/kp/logbook', [\App\Http\Controllers\Mahasiswa\KpController::class, 'storeLogbook'])->name('kp.logbook.store');
-
-    // E-Learning (LMS)
-    Route::get('/lms', [\App\Http\Controllers\Mahasiswa\LmsController::class, 'index'])->name('lms.index');
-
-    // Materi Kuliah
-    Route::get('/materi/{kelas}', [\App\Http\Controllers\Mahasiswa\MateriController::class, 'index'])->name('materi.index');
-    Route::get('/materi/{kelas}/download/{materi}', [\App\Http\Controllers\Mahasiswa\MateriController::class, 'download'])->name('materi.download');
-
-    // Tugas
-    Route::get('/tugas/{kelas}', [\App\Http\Controllers\Mahasiswa\TugasController::class, 'index'])->name('tugas.index');
-    Route::get('/tugas/{kelas}/{tugas}', [\App\Http\Controllers\Mahasiswa\TugasController::class, 'show'])->name('tugas.show');
-    Route::post('/tugas/{kelas}/{tugas}/submit', [\App\Http\Controllers\Mahasiswa\TugasController::class, 'submit'])->name('tugas.submit');
-    Route::get('/tugas/{kelas}/{tugas}/download', [\App\Http\Controllers\Mahasiswa\TugasController::class, 'download'])->name('tugas.download');
-});
-
 // --- DOSEN ROUTES ---
 Route::middleware(['auth', 'role:dosen'])->prefix('dosen')->name('dosen.')->group(function () {
     // Dashboard
@@ -269,3 +202,4 @@ Route::middleware(['auth', 'role:dosen'])->prefix('dosen')->name('dosen.')->grou
 });
 
 require __DIR__.'/auth.php';
+require __DIR__.'/mahasiswa/index.php';
