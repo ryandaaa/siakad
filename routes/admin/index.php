@@ -1,6 +1,6 @@
-<!-- Admin Routes -->
-
 <?php
+
+// Admin routes
 
 require __DIR__.'/master-data/index.php';
 require __DIR__.'/dashboard.php';

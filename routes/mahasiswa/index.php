@@ -1,6 +1,6 @@
-<!-- Mahasiswa Routes -->
-
 <?php
+
+// Mahasiswa routes
 
 require __DIR__.'/ai.php';
 require __DIR__.'/biodata.php';
