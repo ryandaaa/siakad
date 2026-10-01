@@ -50,16 +50,22 @@ class AkademikCalculationService
      */
     public function getGradeDistribution(Mahasiswa $mahasiswa): array
     {
-        $nilai = Nilai::where('mahasiswa_id', $mahasiswa->id)->get();
+        // ⚡ Bolt: Optimize by using database-level aggregation instead of hydrating all models in memory
+        $distributionCounts = Nilai::where('mahasiswa_id', $mahasiswa->id)
+            ->whereNotNull('nilai_huruf')
+            ->selectRaw('nilai_huruf, count(*) as count')
+            ->groupBy('nilai_huruf')
+            ->pluck('count', 'nilai_huruf')
+            ->toArray();
         
         $distribution = [
             'A' => 0, 'B+' => 0, 'B' => 0, 'C+' => 0, 
             'C' => 0, 'D' => 0, 'E' => 0
         ];
 
-        foreach ($nilai as $n) {
-            if (isset($distribution[$n->nilai_huruf])) {
-                $distribution[$n->nilai_huruf]++;
+        foreach ($distributionCounts as $huruf => $count) {
+            if (isset($distribution[$huruf])) {
+                $distribution[$huruf] = $count;
             }
         }
 
